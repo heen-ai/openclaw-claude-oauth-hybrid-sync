@@ -1,70 +1,91 @@
-# openclaw-claude-oauth-hybrid-sync
+# Claude OAuth Hybrid Token Sync
 
-Hybrid OAuth token sync solution for OpenClaw + Claude. Keeps Claude's OAuth tokens fresh across server and laptop environments using a push/pull sync mechanism.
+Keeps Claude Max OAuth tokens fresh across a headless server (OpenClaw on Hetzner) and a laptop (MacBook Pro with browser auth).
 
-## Problem
+## The Problem
 
-Claude's OAuth tokens expire periodically. When running OpenClaw on a remote server, there's no browser to re-authenticate. This solution bridges that gap by syncing tokens from a laptop (where browser auth happens) to the server.
+Claude Max OAuth tokens expire every ~12 hours. On a headless server there's no browser to re-authenticate. Without this, you have to manually refresh and push tokens 2x/day.
 
 ## Architecture
 
 ```
-┌─────────────┐     push      ┌──────────────┐
-│   Laptop    │ ────────────> │    Server    │
-│  (browser)  │               │  (OpenClaw)  │
-│             │ <──────────── │              │
-└─────────────┘     pull      └──────────────┘
+┌─────────────────────┐                    ┌─────────────────────┐
+│   MacBook Pro       │                    │   Hetzner Server    │
+│                     │     SCP push       │                     │
+│ claude login        │ ─────────────────> │ .credentials.json   │
+│ .credentials.json   │   (every 4h via    │        │            │
+│                     │    LaunchAgent)     │        ▼            │
+└─────────────────────┘                    │ sync-claude-tokens  │
+                                           │ (cron every 5min)   │
+                                           │        │            │
+                                           │        ▼            │
+                                           │ auth-profiles.json  │
+                                           │ (all 5 agents)      │
+                                           │        │            │
+                                           │        ▼            │
+                                           │ refresh-claude-token│
+                                           │ (cron every 2h)     │
+                                           │ - tries CC refresh  │
+                                           │ - API fallback      │
+                                           └─────────────────────┘
 ```
 
-### Components
+### Three-Layer Defence
 
-1. **`laptop/push-claude-tokens.sh`** - Pushes fresh tokens from laptop to server via SSH/SCP
-2. **`laptop/com.user.claude-token-push.plist`** - macOS LaunchAgent for automatic push on schedule
-3. **`laptop/pull-claude-tokens.sh`** - Pulls current server tokens to laptop (backup/debug)
-4. **`server/install.sh`** - Server-side setup script
-5. **`server/validate-tokens.sh`** - Validates token freshness and alerts on expiry
+1. **Sync (every 5 min):** Propagates `.credentials.json` tokens to all OpenClaw agent auth-profiles
+2. **Refresh (every 2h):** Proactively refreshes before expiry using Claude Code's built-in auth or direct API
+3. **MBP Push (every 4h):** Laptop pushes fresh tokens as a safety net (when Mac is open)
 
-### Flow
+## Server Setup
 
-1. User authenticates Claude in browser on laptop
-2. LaunchAgent triggers `push-claude-tokens.sh` on a schedule (or manually)
-3. Script SCPs the token file to the server
-4. OpenClaw picks up the refreshed tokens
-5. Server-side validation cron alerts if tokens go stale
+Already installed at:
+- `/root/bin/sync-claude-tokens.sh` - sync cron
+- `/root/bin/refresh-claude-token.sh` - refresh cron
+- Crontab entries for both
 
-## Setup
-
-### Server Side
+## Laptop Setup (macOS)
 
 ```bash
-./server/install.sh
+# 1. Clone the repo
+git clone https://github.com/heen-ai/openclaw-claude-oauth-hybrid-sync.git
+cd openclaw-claude-oauth-hybrid-sync
+
+# 2. Configure
+cp .env.example .env
+# Edit .env if needed (defaults should work for Heenal's setup)
+
+# 3. Test push
+chmod +x laptop/push-claude-tokens.sh
+./laptop/push-claude-tokens.sh
+
+# 4. Install automatic push (every 4h + on wake)
+cp laptop/com.heenal.claude-token-push.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.heenal.claude-token-push.plist
 ```
 
-### Laptop Side (macOS)
+## Verification
 
-1. Copy `laptop/` contents to your machine
-2. Edit the plist with your username and server details
-3. Load the LaunchAgent:
-   ```bash
-   cp laptop/com.user.claude-token-push.plist ~/Library/LaunchAgents/
-   launchctl load ~/Library/LaunchAgents/com.user.claude-token-push.plist
-   ```
+```bash
+# Check sync log
+tail -f /var/log/claude-token-sync.log
 
-## Configuration
+# Check refresh log
+tail -f /var/log/claude-token-refresh.log
 
-Copy `.env.example` to `.env` and fill in:
-
+# Check token status
+python3 -c "
+import json, time
+from datetime import datetime, timezone
+with open('/root/.claude/.credentials.json') as f:
+    d = json.load(f)
+exp = d['claudeAiOauth']['expiresAt'] / 1000
+hrs = (exp - time.time()) / 3600
+print(f'Expires in {hrs:.1f}h ({datetime.fromtimestamp(exp, timezone.utc)})')
+"
 ```
-SERVER_HOST=your-server-ip
-SERVER_USER=root
-SERVER_TOKEN_PATH=/path/to/claude/tokens
-LAPTOP_TOKEN_PATH=~/.claude/tokens
-```
 
-## Status
+## Troubleshooting
 
-🚧 **In development** - Scaffold created, awaiting laptop-side scripts for audit and integration.
-
-## License
-
-MIT
+- **429 rate limit on refresh:** Exponential backoff handles this automatically. The MBP push bypasses the API entirely.
+- **Token expired, server can't refresh:** Push from MBP or run `claude login` on the server (requires browser forwarding).
+- **LaunchAgent not running:** Check `launchctl list | grep claude` and `/tmp/claude-token-push.log`

@@ -3,20 +3,23 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.claude-token-push</string>
+    <string>com.heenal.claude-token-push</string>
     <key>ProgramArguments</key>
     <array>
-        <!-- UPDATE THIS PATH to where you cloned the repo -->
-        <string>/Users/YOUR_USERNAME/openclaw-claude-oauth-hybrid-sync/laptop/push-claude-tokens.sh</string>
+        <string>/Users/heenal/openclaw-claude-oauth-hybrid-sync/laptop/push-claude-tokens.sh</string>
     </array>
-    <key>StartInterval</key>
     <!-- Push every 4 hours (14400 seconds) -->
+    <key>StartInterval</key>
     <integer>14400</integer>
+    <!-- Also push on load (when Mac wakes up) -->
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
     <string>/tmp/claude-token-push.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/claude-token-push.err</string>
+    <!-- Don't let it pile up -->
+    <key>AbandonProcessGroup</key>
+    <true/>
 </dict>
 </plist>
