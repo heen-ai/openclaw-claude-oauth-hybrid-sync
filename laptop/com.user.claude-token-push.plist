@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.heenal.claude-token-push</string>
+    <string>com.user.claude-token-push</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/heenal/openclaw-claude-oauth-hybrid-sync/laptop/push-claude-tokens.sh</string>
+        <string>__INSTALL_DIR__/laptop/push-claude-tokens.sh</string>
     </array>
     <!-- Push every 4 hours (14400 seconds) -->
     <key>StartInterval</key>
@@ -18,7 +18,6 @@
     <string>/tmp/claude-token-push.log</string>
     <key>StandardErrorPath</key>
     <string>/tmp/claude-token-push.err</string>
-    <!-- Don't let it pile up -->
     <key>AbandonProcessGroup</key>
     <true/>
 </dict>

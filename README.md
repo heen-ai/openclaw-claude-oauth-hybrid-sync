@@ -1,90 +1,60 @@
 # Claude OAuth Hybrid Token Sync
 
-Keeps Claude Max OAuth tokens fresh across a headless server (OpenClaw on Hetzner) and a laptop (MacBook Pro with browser auth).
+Keeps Claude Max OAuth tokens fresh across a headless server running [OpenClaw](https://github.com/openclaw/openclaw) and a laptop with browser access for authentication.
 
 ## The Problem
 
-Claude Max OAuth tokens expire every ~12 hours. On a headless server there's no browser to re-authenticate. Without this, you have to manually refresh and push tokens 2x/day.
+Claude Max OAuth tokens expire every ~12 hours. On a headless server there's no browser to re-authenticate. Without automation, you'd need to manually refresh and push tokens twice a day.
 
-## How It Works
+This system solves it with three independent, self-healing loops that cover each other's failure modes.
 
-```
-┌──────────────────────────┐                     ┌──────────────────────────────────────┐
-│     MacBook Pro          │                     │       Hetzner Server (tej)           │
-│                          │                     │                                      │
-│  Claude CLI stores       │   SSH (Tailscale)   │                                      │
-│  refresh token at:       │ ──────────────────> │  .credentials.json                   │
-│  ~/.claude/              │   push-claude-       │  (source of truth on server)         │
-│    last-refresh-token    │   tokens.sh          │         │                            │
-│                          │   (every 4h +        │         │                            │
-│  LaunchAgent triggers    │    on Mac wake)      │         ▼                            │
-│  push automatically      │                     │  ┌─────────────────────┐             │
-│                          │                     │  │ sync-claude-tokens  │             │
-│  Can also pull tokens    │                     │  │ (cron: every 5min)  │             │
-│  FROM server if needed:  │                     │  │                     │             │
-│  pull-claude-tokens.sh   │                     │  │ Propagates to ALL   │             │
-│                          │                     │  │ OpenClaw agents'    │             │
-└──────────────────────────┘                     │  │ auth-profiles.json  │             │
-                                                 │  └─────────┬───────────┘             │
-                                                 │            │                          │
-                                                 │            ▼                          │
-                                                 │  ┌─────────────────────┐             │
-                                                 │  │ refresh-claude-token│             │
-                                                 │  │ (cron: every 2h)   │             │
-                                                 │  │                     │             │
-                                                 │  │ 1. Check expiry     │             │
-                                                 │  │ 2. Try CC refresh   │             │
-                                                 │  │ 3. API fallback     │             │
-                                                 │  │ 4. Backoff on 429   │             │
-                                                 │  └─────────┬───────────┘             │
-                                                 │            │                          │
-                                                 │            ▼                          │
-                                                 │  ┌─────────────────────┐             │
-                                                 │  │ SIGUSR1 → Gateway   │             │
-                                                 │  │ Hot-reload tokens   │             │
-                                                 │  └─────────────────────┘             │
-                                                 │                                      │
-                                                 │  Agents served:                      │
-                                                 │  tej, mira, raksha, waza, rupa,      │
-                                                 │  satya, luz, sutra, spark, klaus,     │
-                                                 │  sakshi                               │
-                                                 └──────────────────────────────────────┘
-```
+## Architecture
+
+![Architecture Diagram](docs/architecture.png)
+
+### How Tokens Flow
+
+1. **Claude CLI on your Mac** stores a refresh token in `~/.claude/last-refresh-token` after you run `claude login` (browser auth)
+2. **Push script** reads that token, SSHs to the server, and updates the server's `.credentials.json`
+3. **Server refresh cron** uses the refresh token to get fresh access tokens from the Anthropic API
+4. **Server sync cron** propagates tokens to all OpenClaw agent auth-profiles
+5. **Gateway signal** (`SIGUSR1`) tells OpenClaw to hot-reload tokens without restart
 
 ### Three-Layer Defence
 
-| Layer | Runs | What It Does |
-|-------|------|-------------|
-| **Sync** | Every 5 min (cron) | Propagates `.credentials.json` tokens → all agent `auth-profiles.json` files + `token-state.json` |
-| **Refresh** | Every 2h (cron) | Proactively refreshes before expiry: tries Claude Code built-in auth first, falls back to direct API call with exponential backoff |
-| **MBP Push** | Every 4h + on wake (LaunchAgent) | Laptop pushes fresh refresh token over SSH as ultimate safety net |
+| Layer | Frequency | Script | What It Does |
+|-------|-----------|--------|-------------|
+| **Refresh** | Every 2h (cron) | `server/refresh-claude-token.sh` | Checks token expiry. If <2h remaining: tries `claude auth status` first, falls back to direct API call. Exponential backoff on 429. |
+| **Sync** | Every 5min (cron) | `server/sync-claude-tokens.sh` | Diffs `.credentials.json` against each agent's `auth-profiles.json`. Updates only on change. Signals gateway for hot-reload. |
+| **Push** | Every 4h + wake (LaunchAgent) | `laptop/push-claude-tokens.sh` | Reads refresh token from Mac, pushes to server via SSH. Safety net — the only layer that can inject a token from browser auth. |
 
-### Token Flow
+## Setup
 
-1. **Claude CLI on Mac** stores refresh token in `~/.claude/last-refresh-token` (new format, no more `.credentials.json` on client)
-2. **Push script** reads that refresh token, SSHs to server, updates server's `.credentials.json`
-3. **Server refresh cron** uses the refresh token to get fresh access tokens from Anthropic API
-4. **Server sync cron** propagates access + refresh tokens to all 11 OpenClaw agent auth-profiles
-5. **Gateway SIGUSR1** tells OpenClaw to hot-reload the updated tokens without restart
+### Prerequisites
 
-## Server Setup
+- A headless server running [OpenClaw](https://github.com/openclaw/openclaw) with Claude Max
+- A Mac (or any machine) where you can run `claude login` in a browser
+- SSH access from laptop to server (Tailscale, VPN, or direct)
 
-Already installed on Hetzner (hostname: `tej`):
+### Server
 
-| File | Purpose |
-|------|---------|
-| `/root/bin/sync-claude-tokens.sh` | Sync cron (propagates tokens to agents) |
-| `/root/bin/refresh-claude-token.sh` | Refresh cron (renews expiring tokens) |
-| `/root/.claude/.credentials.json` | Server-side source of truth |
-| `/root/.openclaw/token-state.json` | Token state tracking |
+```bash
+# 1. Copy scripts to server
+scp server/sync-claude-tokens.sh your-server:/root/bin/
+scp server/refresh-claude-token.sh your-server:/root/bin/
+chmod +x /root/bin/sync-claude-tokens.sh /root/bin/refresh-claude-token.sh
 
-Crontab:
-```cron
-*/5 * * * * /root/bin/sync-claude-tokens.sh >> /var/log/claude-token-sync.log 2>&1
-0 */2 * * * /root/bin/refresh-claude-token.sh >> /var/log/claude-token-refresh.log 2>&1
+# 2. Ensure .credentials.json exists (run claude login once, or create manually)
+# The file lives at /root/.claude/.credentials.json
+
+# 3. Add cron jobs
+crontab -e
+# Add these lines:
+# */5 * * * * /root/bin/sync-claude-tokens.sh >> /var/log/claude-token-sync.log 2>&1
+# 0 */2 * * * /root/bin/refresh-claude-token.sh >> /var/log/claude-token-refresh.log 2>&1
 ```
 
-## Laptop Setup (macOS)
+### Laptop (macOS)
 
 ```bash
 # 1. Clone the repo
@@ -93,17 +63,19 @@ cd openclaw-claude-oauth-hybrid-sync
 
 # 2. Configure
 cp .env.example .env
-# Edit .env - defaults:
-#   SERVER_HOST=tej        (Tailscale hostname)
-#   SERVER_USER=root
+# Edit .env:
+#   SERVER_HOST=your-server    (hostname, Tailscale name, or IP)
+#   SERVER_USER=root           (or your SSH user)
 
-# 3. Test push
+# 3. Test the push
 chmod +x laptop/push-claude-tokens.sh
 ./laptop/push-claude-tokens.sh
 
-# 4. Install automatic push (every 4h + on wake)
-cp laptop/com.user.claude-token-push.plist ~/Library/LaunchAgents/com.heenal.claude-token-push.plist
-launchctl load ~/Library/LaunchAgents/com.heenal.claude-token-push.plist
+# 4. Install the LaunchAgent for automatic push
+# First, edit the plist to set your install path:
+INSTALL_DIR="$(pwd)"
+sed "s|__INSTALL_DIR__|${INSTALL_DIR}|g" laptop/com.user.claude-token-push.plist > ~/Library/LaunchAgents/com.user.claude-token-push.plist
+launchctl load ~/Library/LaunchAgents/com.user.claude-token-push.plist
 ```
 
 ### Pull tokens (debug/recovery)
@@ -111,6 +83,7 @@ launchctl load ~/Library/LaunchAgents/com.heenal.claude-token-push.plist
 If your Mac's Claude CLI loses auth, pull from server:
 
 ```bash
+chmod +x laptop/pull-claude-tokens.sh
 ./laptop/pull-claude-tokens.sh
 ```
 
@@ -119,13 +92,13 @@ This fetches the server's `.credentials.json` and writes both formats (`.credent
 ## Verification
 
 ```bash
-# Check sync log (on server)
+# Check sync log (server)
 tail -f /var/log/claude-token-sync.log
 
-# Check refresh log (on server)
+# Check refresh log (server)
 tail -f /var/log/claude-token-refresh.log
 
-# Check token status (on server)
+# Check token expiry (server)
 python3 -c "
 import json, time
 from datetime import datetime, timezone
@@ -136,8 +109,8 @@ hrs = (exp - time.time()) / 3600
 print(f'Expires in {hrs:.1f}h ({datetime.fromtimestamp(exp, timezone.utc)})')
 "
 
-# Check LaunchAgent (on Mac)
-launchctl list | grep claude
+# Check LaunchAgent (Mac)
+launchctl list | grep claude-token
 cat /tmp/claude-token-push.log
 ```
 
@@ -145,16 +118,48 @@ cat /tmp/claude-token-push.log
 
 | Symptom | Fix |
 |---------|-----|
-| Push script says "No Claude credentials found" | Run `claude login` on your Mac |
-| Push fails with "Connection refused" | Check `.env` uses Tailscale hostname (`tej`), not raw IP |
-| 429 rate limit on refresh | Automatic exponential backoff handles this. MBP push bypasses the API entirely. |
-| Token expired, server can't refresh | Push from MBP, or run `claude login` on server (requires browser forwarding) |
-| LaunchAgent not running | `launchctl list \| grep claude` and check `/tmp/claude-token-push.log` |
-| Pull script fails | Ensure SSH to server works: `ssh root@tej echo ok` |
+| Push says "No Claude credentials found" | Run `claude login` on your Mac |
+| Push fails with "Connection refused" | Check `.env` uses correct hostname/IP. If using Tailscale, use the Tailscale hostname. |
+| 429 rate limit on API refresh | Handled automatically with exponential backoff. MBP push bypasses the API entirely. |
+| Token expired, server can't refresh | Push from Mac, or run `claude login` on server if browser forwarding is available |
+| LaunchAgent not running | `launchctl list \| grep claude-token` and check `/tmp/claude-token-push.log` |
 
 ## Credential Format History
 
 - **Old (pre-2026):** Claude CLI stored full OAuth in `~/.claude/.credentials.json` (access token, refresh token, expiry, scopes)
-- **New (2026+):** Claude CLI stores only refresh token in `~/.claude/last-refresh-token`
+- **New (2026+):** Claude CLI stores only the refresh token in `~/.claude/last-refresh-token`
 - **Server:** Still uses `.credentials.json` format (maintained by refresh cron)
 - **Push script:** Handles both formats automatically (checks `.credentials.json` first, falls back to `last-refresh-token`)
+
+## File Structure
+
+```
+├── .env.example              # Server connection config template
+├── laptop/
+│   ├── push-claude-tokens.sh # Push refresh token from Mac → server
+│   ├── pull-claude-tokens.sh # Pull tokens from server → Mac (debug)
+│   └── com.user.claude-token-push.plist  # macOS LaunchAgent
+├── server/
+│   ├── sync-claude-tokens.sh    # Propagate tokens to all agents
+│   ├── refresh-claude-token.sh  # Proactively refresh expiring tokens
+│   ├── install.sh               # Server setup helper
+│   └── validate-tokens.sh       # Token freshness checker
+└── docs/
+    └── architecture.png         # System architecture diagram
+```
+
+## How It Handles Failures
+
+The system is designed to self-heal:
+
+- **Refresh cron fails?** → MBP push injects fresh refresh token on next cycle
+- **Mac is closed/offline?** → Server refresh cron handles renewal independently
+- **API returns 429?** → Exponential backoff (5min → 15min → 30min → 1h → 2h cap)
+- **Token fully expired?** → Run `claude login` on Mac once, push handles the rest
+- **Agent has stale token?** → Sync cron catches and fixes within 5 minutes
+
+The only unrecoverable scenario is if Anthropic revokes the refresh token entirely (e.g., you log out everywhere). In that case, run `claude login` on the Mac and the system recovers automatically.
+
+## License
+
+MIT
