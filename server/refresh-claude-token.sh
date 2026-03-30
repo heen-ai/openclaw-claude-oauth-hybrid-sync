@@ -17,7 +17,7 @@ CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_URL="https://console.anthropic.com/v1/oauth/token"
 LOCKFILE="/tmp/claude-refresh.lock"
 BACKOFF_FILE="/tmp/claude-refresh-backoff"
-MIN_REMAINING_HOURS=2  # Refresh when less than 2h remaining
+MIN_REMAINING_HOURS=4  # Refresh when less than 4h remaining
 
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') [refresh] $1"
