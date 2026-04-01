@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Claude OAuth Token Refresh v5 - Hybrid Approach
+# Claude OAuth Token Refresh v6
 # 
-# Strategy:
-#   1. Check if .credentials.json token is still valid (>1h until expiry)
-#   2. If expiring soon, try `claude auth status` to trigger CC's built-in refresh
-#   3. If that fails, do manual refresh via API (but with backoff to avoid 429)
-#   4. After any refresh, sync-claude-tokens.sh propagates to all agents
+# Reality check: on a headless server, we can't do browser auth.
+# Method 1 (claude auth status) doesn't actually refresh tokens.
+# Method 2 (direct API) gets 429'd consistently.
+# 
+# The ONLY reliable token source is the Mac pushing via SSH.
+# 
+# This script's job is now:
+#   1. Monitor token health
+#   2. If expiring soon: try API refresh (with sane backoff)
+#   3. If API fails: trigger MBP push by writing a flag file
+#   4. If token is expired: log loudly so we know
 #
-# Run via cron: 0 */2 * * * /root/bin/refresh-claude-token.sh >> /var/log/claude-token-refresh.log 2>&1
+# Run via cron: 0 * * * * /root/bin/refresh-claude-token.sh >> /var/log/claude-token-refresh.log 2>&1
 
 set -euo pipefail
 
@@ -17,7 +23,7 @@ CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_URL="https://console.anthropic.com/v1/oauth/token"
 LOCKFILE="/tmp/claude-refresh.lock"
 BACKOFF_FILE="/tmp/claude-refresh-backoff"
-MIN_REMAINING_HOURS=4  # Refresh when less than 4h remaining
+MIN_REMAINING_HOURS=4  # Start trying to refresh when <4h remaining
 
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') [refresh] $1"
@@ -30,7 +36,6 @@ trap cleanup EXIT
 
 # Prevent concurrent runs
 if ! mkdir "$LOCKFILE" 2>/dev/null; then
-  # Check if lock is stale (>10 min)
   if [[ -d "$LOCKFILE" ]] && [[ $(($(date +%s) - $(stat -c %Y "$LOCKFILE"))) -gt 600 ]]; then
     rm -rf "$LOCKFILE"
     mkdir "$LOCKFILE"
@@ -63,36 +68,31 @@ fi
 
 log "Token expires in ${REMAINING_HOURS}h"
 
-# If token has plenty of time left, reset backoff (new token cycle) and exit
+# Token is healthy - clear backoff, sync, done
 if python3 -c "exit(0 if float('$REMAINING_HOURS') > $MIN_REMAINING_HOURS else 1)" 2>/dev/null; then
-  # Token is healthy - clear any stale backoff from previous cycles
-  if [[ -f "$BACKOFF_FILE" ]]; then
-    log "Clearing stale backoff (token is healthy with ${REMAINING_HOURS}h remaining)"
-    rm -f "$BACKOFF_FILE"
-  fi
+  rm -f "$BACKOFF_FILE"
   log "Token still valid (${REMAINING_HOURS}h remaining), running sync only"
   /root/bin/sync-claude-tokens.sh 2>&1 || true
   exit 0
 fi
 
-# Check if token is already expired (negative remaining hours)
+# Token is expired or expiring
 TOKEN_EXPIRED=false
 if python3 -c "exit(0 if float('$REMAINING_HOURS') < 0 else 1)" 2>/dev/null; then
   TOKEN_EXPIRED=true
-  log "WARNING: Token is ALREADY EXPIRED (${REMAINING_HOURS}h). Ignoring backoff."
+  log "CRITICAL: Token is EXPIRED (${REMAINING_HOURS}h)"
+else
+  log "Token expiring soon (${REMAINING_HOURS}h remaining), attempting refresh..."
 fi
 
-log "Token expiring soon, attempting refresh..."
-
-# Check exponential backoff (avoid hammering Anthropic)
-# BUT: never let backoff block a refresh for an already-expired token
+# Check backoff - but NEVER block if token is already expired
 if [[ -f "$BACKOFF_FILE" ]] && [[ "$TOKEN_EXPIRED" != "true" ]]; then
-  LAST_ATTEMPT=$(cat "$BACKOFF_FILE" 2>/dev/null | head -1)
-  FAIL_COUNT=$(cat "$BACKOFF_FILE" 2>/dev/null | tail -1)
+  LAST_ATTEMPT=$(head -1 "$BACKOFF_FILE" 2>/dev/null)
+  FAIL_COUNT=$(tail -1 "$BACKOFF_FILE" 2>/dev/null)
   NOW=$(date +%s)
-  # Backoff: 5min, 10min, 20min, 30min max (capped - never blocks for hours)
+  # Backoff: 5min, 10min, 20min, 30min max
   BACKOFF_SECS=$((300 * (2 ** (FAIL_COUNT < 3 ? FAIL_COUNT : 3))))
-  [[ $BACKOFF_SECS -gt 1800 ]] && BACKOFF_SECS=1800  # Hard cap: 30 minutes
+  [[ $BACKOFF_SECS -gt 1800 ]] && BACKOFF_SECS=1800
   if [[ $((NOW - LAST_ATTEMPT)) -lt $BACKOFF_SECS ]]; then
     WAIT_MINS=$(( (BACKOFF_SECS - (NOW - LAST_ATTEMPT)) / 60 ))
     log "Backoff active: waiting ${WAIT_MINS}m before next attempt (${FAIL_COUNT} failures)"
@@ -100,32 +100,10 @@ if [[ -f "$BACKOFF_FILE" ]] && [[ "$TOKEN_EXPIRED" != "true" ]]; then
   fi
 fi
 
-# If expired, always clear backoff and try
-if [[ "$TOKEN_EXPIRED" == "true" ]]; then
-  rm -f "$BACKOFF_FILE"
-fi
+# Clear backoff if expired (emergency mode)
+[[ "$TOKEN_EXPIRED" == "true" ]] && rm -f "$BACKOFF_FILE"
 
-# Method 1: Try triggering Claude Code's own refresh
-# Running a minimal command forces CC to check/refresh its auth
-log "Method 1: Triggering Claude Code auth check..."
-BEFORE_MTIME=$(stat -c %Y "$CREDS_FILE")
-
-# Run claude auth status - this triggers internal refresh if needed
-timeout 30 claude auth status > /dev/null 2>&1 || true
-
-sleep 2
-AFTER_MTIME=$(stat -c %Y "$CREDS_FILE")
-
-if [[ "$AFTER_MTIME" -gt "$BEFORE_MTIME" ]]; then
-  log "SUCCESS: Claude Code refreshed the token"
-  rm -f "$BACKOFF_FILE"
-  /root/bin/sync-claude-tokens.sh 2>&1 || true
-  exit 0
-fi
-
-# Method 2: Direct API refresh (fallback)
-log "Method 2: Direct API refresh..."
-
+# Try API refresh
 REFRESH_TOKEN=$(python3 -c "
 import json
 with open('$CREDS_FILE') as f:
@@ -138,6 +116,7 @@ if [[ -z "$REFRESH_TOKEN" ]]; then
   exit 1
 fi
 
+log "Attempting API refresh..."
 RESPONSE_FILE=$(mktemp)
 HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" -X POST "$TOKEN_URL" \
   -H "Content-Type: application/x-www-form-urlencoded" \
@@ -146,37 +125,14 @@ HTTP_CODE=$(curl -s -o "$RESPONSE_FILE" -w "%{http_code}" -X POST "$TOKEN_URL" \
 
 log "API response: HTTP $HTTP_CODE"
 
-if [[ "$HTTP_CODE" == "429" ]]; then
-  # Rate limited - increment backoff
-  FAIL_COUNT=0
-  [[ -f "$BACKOFF_FILE" ]] && FAIL_COUNT=$(tail -1 "$BACKOFF_FILE" 2>/dev/null || echo 0)
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-  echo "$(date +%s)" > "$BACKOFF_FILE"
-  echo "$FAIL_COUNT" >> "$BACKOFF_FILE"
-  log "Rate limited (429). Backoff count: $FAIL_COUNT"
-  rm -f "$RESPONSE_FILE"
-  exit 1
-fi
-
-NEW_ACCESS=$(python3 -c "import json; print(json.load(open('$RESPONSE_FILE')).get('access_token',''))" 2>/dev/null)
-NEW_REFRESH=$(python3 -c "import json; print(json.load(open('$RESPONSE_FILE')).get('refresh_token',''))" 2>/dev/null)
-
-if [[ -z "$NEW_ACCESS" ]]; then
-  ERROR=$(python3 -c "import json; d=json.load(open('$RESPONSE_FILE')); print(d.get('error_description', d.get('error', 'unknown')))" 2>/dev/null || echo "parse error")
-  log "ERROR: Refresh failed - $ERROR"
-  FAIL_COUNT=0
-  [[ -f "$BACKOFF_FILE" ]] && FAIL_COUNT=$(tail -1 "$BACKOFF_FILE" 2>/dev/null || echo 0)
-  FAIL_COUNT=$((FAIL_COUNT + 1))
-  echo "$(date +%s)" > "$BACKOFF_FILE"
-  echo "$FAIL_COUNT" >> "$BACKOFF_FILE"
-  rm -f "$RESPONSE_FILE"
-  exit 1
-fi
-
-[[ -z "$NEW_REFRESH" ]] && NEW_REFRESH="$REFRESH_TOKEN"
-
-# Apply new tokens to .credentials.json
-python3 -c "
+if [[ "$HTTP_CODE" == "200" ]]; then
+  NEW_ACCESS=$(python3 -c "import json; print(json.load(open('$RESPONSE_FILE')).get('access_token',''))" 2>/dev/null)
+  NEW_REFRESH=$(python3 -c "import json; print(json.load(open('$RESPONSE_FILE')).get('refresh_token',''))" 2>/dev/null)
+  
+  if [[ -n "$NEW_ACCESS" ]]; then
+    [[ -z "$NEW_REFRESH" ]] && NEW_REFRESH="$REFRESH_TOKEN"
+    
+    python3 -c "
 import json, time
 with open('$CREDS_FILE') as f:
     d = json.load(f)
@@ -186,9 +142,32 @@ d['claudeAiOauth']['expiresAt'] = int(time.time() * 1000) + (12 * 60 * 60 * 1000
 with open('$CREDS_FILE', 'w') as f:
     json.dump(d, f, indent=2)
 " 2>/dev/null
+    
+    log "SUCCESS: Token refreshed via API"
+    rm -f "$BACKOFF_FILE" "$RESPONSE_FILE"
+    /root/bin/sync-claude-tokens.sh 2>&1 || true
+    exit 0
+  fi
+fi
 
-log "SUCCESS: Token refreshed via API"
-rm -f "$BACKOFF_FILE" "$RESPONSE_FILE"
+# API failed - increment backoff
+FAIL_COUNT=0
+[[ -f "$BACKOFF_FILE" ]] && FAIL_COUNT=$(tail -1 "$BACKOFF_FILE" 2>/dev/null || echo 0)
+FAIL_COUNT=$((FAIL_COUNT + 1))
+echo "$(date +%s)" > "$BACKOFF_FILE"
+echo "$FAIL_COUNT" >> "$BACKOFF_FILE"
 
-# Sync to all agents
-/root/bin/sync-claude-tokens.sh 2>&1 || true
+ERROR_DETAIL=""
+[[ "$HTTP_CODE" == "429" ]] && ERROR_DETAIL="rate limited"
+[[ -z "$ERROR_DETAIL" ]] && ERROR_DETAIL=$(python3 -c "import json; d=json.load(open('$RESPONSE_FILE')); print(d.get('error_description', d.get('error', 'unknown')))" 2>/dev/null || echo "unknown")
+
+log "API refresh failed: HTTP $HTTP_CODE ($ERROR_DETAIL). Backoff count: $FAIL_COUNT"
+log "Waiting for MBP push (LaunchAgent runs every 4h + on wake)"
+
+rm -f "$RESPONSE_FILE"
+
+# If token is expired and API failed, this is critical
+if [[ "$TOKEN_EXPIRED" == "true" ]]; then
+  log "CRITICAL: Token expired and API refresh failed. Agents are down until MBP pushes new tokens."
+  log "Manual fix: run ./laptop/push-claude-tokens.sh from your Mac"
+fi
