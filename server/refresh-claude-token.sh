@@ -63,27 +63,46 @@ fi
 
 log "Token expires in ${REMAINING_HOURS}h"
 
-# If token has plenty of time left, just sync and exit
+# If token has plenty of time left, reset backoff (new token cycle) and exit
 if python3 -c "exit(0 if float('$REMAINING_HOURS') > $MIN_REMAINING_HOURS else 1)" 2>/dev/null; then
+  # Token is healthy - clear any stale backoff from previous cycles
+  if [[ -f "$BACKOFF_FILE" ]]; then
+    log "Clearing stale backoff (token is healthy with ${REMAINING_HOURS}h remaining)"
+    rm -f "$BACKOFF_FILE"
+  fi
   log "Token still valid (${REMAINING_HOURS}h remaining), running sync only"
   /root/bin/sync-claude-tokens.sh 2>&1 || true
   exit 0
 fi
 
+# Check if token is already expired (negative remaining hours)
+TOKEN_EXPIRED=false
+if python3 -c "exit(0 if float('$REMAINING_HOURS') < 0 else 1)" 2>/dev/null; then
+  TOKEN_EXPIRED=true
+  log "WARNING: Token is ALREADY EXPIRED (${REMAINING_HOURS}h). Ignoring backoff."
+fi
+
 log "Token expiring soon, attempting refresh..."
 
 # Check exponential backoff (avoid hammering Anthropic)
-if [[ -f "$BACKOFF_FILE" ]]; then
+# BUT: never let backoff block a refresh for an already-expired token
+if [[ -f "$BACKOFF_FILE" ]] && [[ "$TOKEN_EXPIRED" != "true" ]]; then
   LAST_ATTEMPT=$(cat "$BACKOFF_FILE" 2>/dev/null | head -1)
   FAIL_COUNT=$(cat "$BACKOFF_FILE" 2>/dev/null | tail -1)
   NOW=$(date +%s)
-  # Backoff: 5min, 15min, 30min, 1h, 2h (capped)
-  BACKOFF_SECS=$((300 * (2 ** (FAIL_COUNT < 5 ? FAIL_COUNT : 5))))
+  # Backoff: 5min, 10min, 20min, 30min max (capped - never blocks for hours)
+  BACKOFF_SECS=$((300 * (2 ** (FAIL_COUNT < 3 ? FAIL_COUNT : 3))))
+  [[ $BACKOFF_SECS -gt 1800 ]] && BACKOFF_SECS=1800  # Hard cap: 30 minutes
   if [[ $((NOW - LAST_ATTEMPT)) -lt $BACKOFF_SECS ]]; then
     WAIT_MINS=$(( (BACKOFF_SECS - (NOW - LAST_ATTEMPT)) / 60 ))
     log "Backoff active: waiting ${WAIT_MINS}m before next attempt (${FAIL_COUNT} failures)"
     exit 0
   fi
+fi
+
+# If expired, always clear backoff and try
+if [[ "$TOKEN_EXPIRED" == "true" ]]; then
+  rm -f "$BACKOFF_FILE"
 fi
 
 # Method 1: Try triggering Claude Code's own refresh
